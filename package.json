@@ -1,6 +1,6 @@
 {
   "name": "powertokens-cli",
-  "version": "1.0.48",
+  "version": "1.0.49",
   "description": "PowerTokens CLI — 终端里调用国产 AI 模型（DeepSeek/GLM/Qwen/Seedream/Seedance）",
   "type": "module",
   "bin": {
