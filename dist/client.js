@@ -13,6 +13,83 @@ function headers() {
         Accept: "application/json",
     };
 }
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+// 带重试的 fetch：仅对临时性失败重试 ——
+// 网络错误（fetch failed，常见于连接被重置/keep-alive 陈旧 socket/DNS 抖动）、
+// 单次请求超时、429、5xx；4xx 等明确业务错误不重试，直接返回 Response 交由调用方处理。
+async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 30000) {
+    let lastErr;
+    for (let i = 0; i <= retries; i++) {
+        if (i > 0) {
+            // 重试前尊重 Retry-After，否则指数退避（1s/2s/4s…，上限 15s）
+            await sleep(Math.min(1000 * 2 ** (i - 1), 15000));
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetch(url, { ...options, signal: controller.signal });
+            if ((res.status === 429 || res.status >= 500) && i < retries) {
+                const ra = parseInt(res.headers.get("retry-after") || "", 10);
+                if (Number.isFinite(ra) && ra > 0)
+                    await sleep(Math.min(ra * 1000, 15000));
+                if (process.env.PT_DEBUG)
+                    console.error(`[pt debug] GET ${url} => ${res.status}，第 ${i + 1} 次，重试中`);
+                continue;
+            }
+            return res;
+        }
+        catch (e) {
+            lastErr = e;
+            if (process.env.PT_DEBUG) {
+                const code = e?.cause?.code || e?.name || e?.message;
+                console.error(`[pt debug] fetch ${url} 第 ${i + 1}/${retries + 1} 次失败: ${code}`);
+            }
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    if (lastErr?.name === "AbortError")
+        throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s），连续 ${retries + 1} 次未成功`);
+    const cause = lastErr?.cause ? ` (${lastErr.cause.code || lastErr.cause.message || lastErr.cause})` : "";
+    throw new Error(`fetch failed${cause}`);
+}
+// 轮询专用 GET JSON：内部对网络抖动做有限重试；
+// 重试用尽 / JSON 解析失败时返回 null（任务在服务端可能仍在生成甚至已成功，外层应继续轮询）；
+// 401/403/404 等明确客户端错误立即抛出（继续重试无意义）。
+async function pollFetchJson(url) {
+    let res;
+    try {
+        res = await fetchWithRetry(url, { headers: headers() }, 2, 30000);
+    }
+    catch {
+        return null;
+    }
+    if (res.status === 401 || res.status === 403 || res.status === 404) {
+        throw new Error(`API ${res.status}: ${await res.text().catch(() => "")}`);
+    }
+    if (!res.ok)
+        return null;
+    try {
+        return await res.json();
+    }
+    catch {
+        return null;
+    }
+}
+// 统一的轮询退避节奏
+function pollDelay(attempts) {
+    return Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
+}
+// 轮询整体超时的错误信息；若期间发生过网络抖动，提示任务可能已在服务端完成
+function pollTimeoutMsg(taskId, timeoutMs, netErrors) {
+    const base = `Task ${taskId} timeout after ${timeoutMs / 1000}s`;
+    return netErrors > 0
+        ? `${base} (polling hit ${netErrors} network error(s); the task may have completed server-side)`
+        : base;
+}
 export async function chatCompletion(params) {
     const body = {
         model: params.model,
@@ -24,11 +101,25 @@ export async function chatCompletion(params) {
     if (params.system) {
         body.messages = [{ role: "system", content: params.system }, ...params.messages];
     }
-    const res = await fetch(`${getBaseUrl()}/v1/chat/completions`, {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(body),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120000);
+    let res;
+    try {
+        res = await fetch(`${getBaseUrl()}/v1/chat/completions`, {
+            method: "POST",
+            headers: headers(),
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+    }
+    catch (e) {
+        clearTimeout(timer);
+        const cause = e?.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : "";
+        if (e.name === "AbortError")
+            throw new Error(`请求超时（120s）。模型 ${params.model} 可能未响应或上游不可用。`);
+        throw new Error(`fetch failed${cause}`);
+    }
+    clearTimeout(timer);
     if (!res.ok) {
         const err = await res.text();
         throw new Error(`API ${res.status}: ${err}`);
@@ -98,10 +189,15 @@ async function generateKlingImage(p) {
 async function pollKlingImageTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/kling/v1/images/generations/${taskId}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/kling/v1/images/generations/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         const status = data.data?.task_status ?? data.task_status;
         if (status === "succeed") {
             const images = data.data?.task_result?.images ?? [];
@@ -109,10 +205,9 @@ async function pollKlingImageTask(taskId, timeoutMs) {
         }
         if (status === "failed")
             throw new Error(data.data?.task_status_msg || "Kling task failed");
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // Qwen / Wan：POST /v1/images/generations，提示词在 input.messages[0].content[0].text
 async function generateAliImage(p) {
@@ -195,7 +290,8 @@ function imageInput(ref, plainBase64 = false) {
 function postJson(url, body) {
     if (process.env.PT_DEBUG)
         console.error(`[pt debug] POST ${url}\n[pt debug] ${JSON.stringify(body, null, 2)}`);
-    return fetch(url, { method: "POST", headers: headers(), body: JSON.stringify(body) }).then(async (res) => {
+    // 网络错误时重试 2 次（极端情况下可能在服务端产生重复任务，但远好于任务已创建却报 fetch failed）
+    return fetchWithRetry(url, { method: "POST", headers: headers(), body: JSON.stringify(body) }, 2, 60000).then(async (res) => {
         if (!res.ok)
             throw new Error(`API ${res.status}: ${await res.text()}`);
         return res.json();
@@ -223,16 +319,21 @@ async function generateHailuoVideo(p) {
 async function pollMinimaxV1Task(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/minimax/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/minimax/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         const status = data.status ?? data.base_resp?.status_code;
         if (status === "Success" || status === "success" || status === 0) {
             const fileId = data.file_id;
             if (fileId) {
                 // 通过 file_id 获取下载 URL
-                const dl = await fetch(`${getBaseUrl()}/minimax/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`, { headers: headers() });
+                const dl = await fetchWithRetry(`${getBaseUrl()}/minimax/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`, { headers: headers() }, 2, 30000);
                 const dlData = await dl.json();
                 const url = dlData.file?.download_url ?? dlData.download_url ?? dlData.url;
                 return { url, file_id: fileId, elapsed_ms: Date.now() - start };
@@ -242,10 +343,9 @@ async function pollMinimaxV1Task(taskId, timeoutMs) {
         if (status === "Failed" || status === "failed") {
             throw new Error(data.base_resp?.status_msg || data.status_msg || "MiniMax task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // MiniMax H3（v2 官方透传）：POST /minimax/v2/video_generation，content 数组
 async function generateMinimaxH3Video(p) {
@@ -278,20 +378,24 @@ async function generateMinimaxH3Video(p) {
 async function pollMinimaxH3Task(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/minimax/v2/query/video_generation/${taskId}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/minimax/v2/query/video_generation/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (data.status === "succeeded") {
             return { url: data.content?.url, elapsed_ms: Date.now() - start };
         }
         if (data.status === "failed" || data.status === "cancelled") {
             throw new Error(data.message || data.error || "MiniMax H3 task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // Kling：POST /kling/v1/videos/{text2video|image2video}，参数名 model_name，image 用纯 Base64
 async function generateKlingVideo(p) {
@@ -329,10 +433,15 @@ async function generateKlingVideo(p) {
 async function pollKlingTask(taskId, endpoint, timeoutMs, wantWatermark = false) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}${endpoint}/${taskId}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}${endpoint}/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         const status = data.data?.task_status ?? data.task_status;
         if (status === "succeed") {
             if (process.env.PT_DEBUG)
@@ -347,10 +456,9 @@ async function pollKlingTask(taskId, endpoint, timeoutMs, wantWatermark = false)
                 console.error(`[pt debug] ${endpoint}/${taskId} => ${JSON.stringify(data, null, 2)}`);
             throw new Error(data.data?.task_status_msg || "Kling task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // Kling 运镜控制：POST /kling/v1/videos/motion-control
 // 支持 --ref/--ref-video/--character-orientation 便利映射；其余参数（video_url 等）均可通过 --params 透传
@@ -463,10 +571,15 @@ async function generateViduVideo(p) {
 async function pollViduTask(taskId, timeoutMs, wantWatermark = false) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/vidu/ent/v2/tasks/${taskId}/creations`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/vidu/ent/v2/tasks/${taskId}/creations`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (data.state === "success") {
             const c = data.creations?.[0];
             // Vidu 主 url 无水印，带水印版本在 watermarked_url；传 --watermark 时取水印版
@@ -475,10 +588,9 @@ async function pollViduTask(taskId, timeoutMs, wantWatermark = false) {
         }
         if (data.state === "failed")
             throw new Error(data.err_code || "Vidu task failed");
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // HappyHorse：POST /ali/api/v1/services/aigc/video-generation/video-synthesis
 async function generateHappyHorseVideo(p) {
@@ -497,19 +609,23 @@ async function generateHappyHorseVideo(p) {
 async function pollHappyHorseTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/ali/api/v1/tasks/${taskId}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/ali/api/v1/tasks/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (data.task_status === "SUCCEEDED") {
             return { url: data.video_url, elapsed_ms: Date.now() - start };
         }
         if (data.task_status === "FAILED")
             throw new Error(data.message || "HappyHorse task failed");
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // 统一视频生成入口：按模型判断供应商并分派
 export async function generateVideo(params) {
@@ -631,20 +747,24 @@ async function generateSeedanceNative(p) {
 async function pollSeedanceNativeTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/byteplus/api/v3/contents/generations/tasks/${taskId}`, { headers: headers() });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/byteplus/api/v3/contents/generations/tasks/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (data.status === "succeeded") {
             return { url: data.content?.video_url, elapsed_ms: Date.now() - start };
         }
         if (data.status === "failed" || data.status === "expired") {
             throw new Error(data.error?.message || data.message || "Seedance task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // ─── Asset Library（资产库）────────────────────────────
 // 资产库与生成类 API 是不同域名，但从生成类域名可推导：
@@ -709,15 +829,19 @@ async function pollAssetId(taskId, timeoutMs = 120000) {
     let attempts = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${assetBaseUrl()}/v1/asset/jobs/get-asset-id?task_id=${encodeURIComponent(taskId)}`, { headers: { "User-Agent": "powertokensAi" } });
-        if (res.ok) {
-            const data = await res.json();
-            const assetId = data?.data?.asset_id ?? data?.asset_id;
-            if (data?.code === 200 && assetId)
-                return assetId;
+        try {
+            const res = await fetchWithRetry(`${assetBaseUrl()}/v1/asset/jobs/get-asset-id?task_id=${encodeURIComponent(taskId)}`, { headers: { "User-Agent": "powertokensAi" } }, 2, 30000);
+            if (res.ok) {
+                const data = await res.json();
+                const assetId = data?.data?.asset_id ?? data?.asset_id;
+                if (data?.code === 200 && assetId)
+                    return assetId;
+            }
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        catch {
+            // 网络抖动：不中断轮询
+        }
+        await sleep(pollDelay(attempts));
     }
     throw new Error(`获取 asset_id 超时（${timeoutMs / 1000}s）`);
 }
@@ -894,22 +1018,24 @@ export function getModels() {
 async function pollTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/v1/tasks/${taskId}`, {
-            headers: headers(),
-        });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/v1/tasks/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (data.status === "completed" || data.status === "succeeded") {
             return { ...data, elapsed_ms: Date.now() - start };
         }
         if (data.status === "failed" || data.status === "error") {
             throw new Error(data.error || data.message || "Task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }
 // 视频任务轮询：走 /v1/videos/{task_id}（与 /v1/tasks 不同），
 // 成功状态为 completed，视频 URL 在 metadata.url。
@@ -917,12 +1043,15 @@ async function pollVideoTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
     let lastProgress = -1;
+    let netErrors = 0;
     while (Date.now() - start < timeoutMs) {
         attempts++;
-        const res = await fetch(`${getBaseUrl()}/v1/videos/${taskId}`, {
-            headers: headers(),
-        });
-        const data = await res.json();
+        const data = await pollFetchJson(`${getBaseUrl()}/v1/videos/${taskId}`);
+        if (!data) {
+            netErrors++;
+            await sleep(pollDelay(attempts));
+            continue;
+        }
         if (typeof data.progress === "number" && data.progress !== lastProgress) {
             lastProgress = data.progress;
             console.error(`  [pt] ${data.status ?? "processing"}: ${data.progress}%`);
@@ -937,8 +1066,7 @@ async function pollVideoTask(taskId, timeoutMs) {
         if (data.status === "failed" || data.status === "error" || data.status === "cancelled" || data.status === "expired") {
             throw new Error(data.error?.message || data.message || data.error || "Task failed");
         }
-        const delay = Math.min(2000 * Math.pow(2, Math.min(attempts, 4)), 30000);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(pollDelay(attempts));
     }
-    throw new Error(`Task ${taskId} timeout after ${timeoutMs / 1000}s`);
+    throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
 }

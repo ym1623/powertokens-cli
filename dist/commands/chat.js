@@ -1,5 +1,5 @@
 import { chatCompletion } from "../client.js";
-import { getApiKey } from "../config.js";
+import { getApiKey, getBaseUrl } from "../config.js";
 import chalk from "chalk";
 export async function chatCmd(prompt, options) {
     const key = getApiKey();
@@ -38,7 +38,11 @@ export async function chatCmd(prompt, options) {
         }
     }
     catch (err) {
-        console.error(chalk.red(`❌ ${err.message}`));
+        // undici 把网络错误包成 "fetch failed"，真正原因在 err.cause（如 ETIMEDOUT/ECONNRESET/socket hang up）
+        const cause = err?.cause ? ` → ${err.cause.code || err.cause.message || err.cause}` : "";
+        console.error(chalk.red(`❌ ${err.message}${cause}`));
+        console.error(chalk.dim(`   端点: ${getBaseUrl()}/v1/chat/completions  模型: ${model}`));
+        console.error(chalk.dim(`   若模型名不存在或上游不可用，会以 "fetch failed" 形式表现。运行 pt models 确认可用模型。`));
         process.exit(1);
     }
 }

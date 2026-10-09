@@ -10,7 +10,7 @@ const program = new Command();
 program
     .name("pt")
     .description("PowerTokens CLI — terminal access to Chinese AI models")
-    .version("1.0.49");
+    .version("1.0.50");
 program
     .command("login")
     .description("Configure your PowerTokens API key")

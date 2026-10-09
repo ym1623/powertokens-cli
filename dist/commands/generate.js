@@ -15,11 +15,21 @@ export async function generateCmd(options) {
     const models = await listModels();
     const info = models.find((m) => m.id.toLowerCase() === model.toLowerCase());
     let modelType = classifyModel(model, info?.endpointTypes ?? []);
-    // 多模态模型（如 kling-v3）按参数分流：传了视频专属参数则按视频处理
+    // 多模态模型（如 kling-v3）按 -o 输出扩展名分流：图片扩展名→image，视频扩展名→video；
+    // 无 -o 或无法识别时，回退到视频专属参数（duration/refVideo/refAudio/lastFrame/sound）判断
     if (isMultimodalModel(model)) {
-        const videoIntent = options.duration || options.resolution || options.sound || options.refVideo || options.refAudio || options.lastFrame;
-        if (videoIntent)
+        const ext = options.output ? path.extname(options.output).toLowerCase() : "";
+        const imageExt = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"];
+        const videoExt = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".flv", ".wmv"];
+        if (imageExt.includes(ext))
+            modelType = "image";
+        else if (videoExt.includes(ext))
             modelType = "video";
+        else {
+            const videoIntent = options.duration || options.refVideo || options.refAudio || options.lastFrame || options.sound;
+            if (videoIntent)
+                modelType = "video";
+        }
     }
     // 解析 --params JSON 透传（提前解析，用于判断是否完全透传）
     let extra;
@@ -130,13 +140,37 @@ export async function generateCmd(options) {
         process.exit(1);
     }
 }
+class NonRetryableDownloadError extends Error {
+}
 async function downloadFile(url, filepath) {
-    const res = await fetch(url);
-    if (!res.ok)
-        throw new Error(`Download failed: ${res.status}`);
-    const dir = path.dirname(filepath);
-    if (dir && !fs.existsSync(dir))
-        fs.mkdirSync(dir, { recursive: true });
-    const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(filepath, buf);
+    let lastErr;
+    for (let i = 0; i < 3; i++) {
+        if (i > 0)
+            await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** (i - 1), 10000)));
+        try {
+            const res = await fetch(url);
+            // 429/5xx 视为临时性失败，重试；其余状态码（如 403 签名失效）重试无意义
+            if (!res.ok) {
+                if (i < 2 && (res.status === 429 || res.status >= 500)) {
+                    lastErr = new Error(`Download failed: ${res.status}`);
+                    continue;
+                }
+                throw new NonRetryableDownloadError(`Download failed: ${res.status}`);
+            }
+            const dir = path.dirname(filepath);
+            if (dir && !fs.existsSync(dir))
+                fs.mkdirSync(dir, { recursive: true });
+            const buf = Buffer.from(await res.arrayBuffer());
+            fs.writeFileSync(filepath, buf);
+            return;
+        }
+        catch (e) {
+            if (e instanceof NonRetryableDownloadError)
+                throw e;
+            // 网络错误（fetch failed）：退避后重试
+            lastErr = e;
+        }
+    }
+    const cause = lastErr?.cause ? ` (${lastErr.cause.code || lastErr.cause.message || lastErr.cause})` : "";
+    throw new Error(cause ? `Download failed: fetch failed${cause}` : lastErr);
 }
