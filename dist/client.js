@@ -896,6 +896,44 @@ export async function resolveAssetRef(ref, groupId) {
         }
     }
 }
+// Playground 文件上传：POST {assetBaseUrl}/playground/file-upload
+// 用于把本地 --ref-video / --ref-audio 上传拿到公网 URL，供后续各 provider 直接引用。
+// 与资产库 /v1/asset/upload（返回 asset_id，需轮询）不同，此端点同步返回文件 URL。
+// 已是 URL / asset:// / data: 的引用不算本地文件，由调用方自行跳过。
+export function isLocalFileRef(ref) {
+    if (!ref)
+        return false;
+    if (ref.startsWith("asset://") || /^https?:\/\//i.test(ref) || /^data:/.test(ref))
+        return false;
+    return true;
+}
+export async function uploadPlaygroundFile(filePath) {
+    const key = getApiKey();
+    if (!key)
+        throw new Error("未配置 API Key。运行: pt login");
+    if (!fs.existsSync(filePath))
+        throw new Error(`文件不存在: ${filePath}`);
+    const data = fs.readFileSync(filePath);
+    const form = new FormData();
+    form.append("file", new Blob([data]), path.basename(filePath));
+    const res = await fetchWithRetry(`${assetBaseUrl()}/playground/file-upload`, {
+        method: "POST",
+        headers: assetHeaders(key),
+        body: form,
+    }, 2, 300000);
+    if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`文件上传失败 ${res.status}: ${err}`);
+    }
+    const resp = await res.json();
+    // 响应格式：{ code: 200, data: "<url>", msg: "" }，data 直接是字符串 URL
+    const url = (typeof resp?.data === "string" ? resp.data : "")
+        || resp?.data?.url || resp?.data?.file_url || resp?.data?.fileUrl
+        || resp?.url || resp?.file_url || resp?.fileUrl || "";
+    if (!url)
+        throw new Error(`文件上传未返回 URL: ${JSON.stringify(resp)}`);
+    return url;
+}
 // 判断模型是否「多模态」（同时支持图片和视频生成）。
 // 这类模型仅凭 id 无法确定用户意图，需配合参数分流。
 export function isMultimodalModel(id) {

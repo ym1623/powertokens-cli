@@ -1,4 +1,4 @@
-import { generateImage, generateVideo, textToSpeech, classifyModel, isMultimodalModel, listModels } from "../client.js";
+import { generateImage, generateVideo, textToSpeech, classifyModel, isMultimodalModel, listModels, uploadPlaygroundFile, isLocalFileRef } from "../client.js";
 import { getApiKey } from "../config.js";
 import chalk from "chalk";
 import fs from "node:fs";
@@ -53,6 +53,16 @@ export async function generateCmd(options) {
     const spinner = (await import("ora")).default;
     let spin = spinner("Generating...").start();
     try {
+        // 预处理：--ref-video / --ref-audio 若为本地文件，先上传到 playground/file-upload 拿公网 URL
+        // （已是 URL / asset:// / data: 的原样保留），供后续各 provider 直接引用
+        if (options.refVideo && isLocalFileRef(options.refVideo)) {
+            spin.text = `Uploading --ref-video (${path.basename(options.refVideo)})...`;
+            options.refVideo = await uploadPlaygroundFile(options.refVideo);
+        }
+        if (options.refAudio && isLocalFileRef(options.refAudio)) {
+            spin.text = `Uploading --ref-audio (${path.basename(options.refAudio)})...`;
+            options.refAudio = await uploadPlaygroundFile(options.refAudio);
+        }
         if (modelType === "image") {
             const result = await generateImage({
                 model,
