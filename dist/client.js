@@ -57,8 +57,9 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 30000)
     throw new Error(`fetch failed${cause}`);
 }
 // 轮询专用 GET JSON：内部对网络抖动做有限重试；
-// 重试用尽 / JSON 解析失败时返回 null（任务在服务端可能仍在生成甚至已成功，外层应继续轮询）；
-// 401/403/404 等明确客户端错误立即抛出（继续重试无意义）。
+// 重试用尽 / JSON 解析失败 / 5xx / 429 时返回 null（任务在服务端可能仍在生成甚至已成功，外层应继续轮询）；
+// 其余 4xx 是明确的请求错误（如任务不存在 task_not_exist），立即抛出并带上服务端原始响应——
+// 否则真实报错会被静默吞掉，用户只能看到轮询超时。408/429 属于可重试状态，仍按抖动处理。
 async function pollFetchJson(url) {
     let res;
     try {
@@ -67,8 +68,16 @@ async function pollFetchJson(url) {
     catch {
         return null;
     }
-    if (res.status === 401 || res.status === 403 || res.status === 404) {
-        throw new Error(`API ${res.status}: ${await res.text().catch(() => "")}`);
+    // 4xx 中只有 408（超时）和 429（限流）值得重试，其余都是请求本身的错误，直接抛出真实响应
+    if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        const body = await res.text().catch(() => "");
+        let detail = body;
+        try {
+            const j = JSON.parse(body);
+            detail = j?.message || j?.error?.message || j?.code || body;
+        }
+        catch { }
+        throw new Error(`API ${res.status}: ${detail || "未知错误"}`);
     }
     if (!res.ok)
         return null;
@@ -186,6 +195,14 @@ async function generateKlingImage(p) {
     const taskId = data.data?.task_id ?? data.task_id;
     return taskId ? pollKlingImageTask(taskId, 180000) : data;
 }
+// Kling 任务失败：task_status_msg 可能为空字符串，此时 CLI 只会显示兜底的 "Kling task failed"。
+// 这里统一带上服务端完整原始响应，便于定位真实失败原因（如内容审核、素材/URL 不可达等）。
+function klingTaskError(data) {
+    const raw = JSON.stringify(data, null, 2);
+    const msg = data?.data?.task_status_msg || data?.task_status_msg || "Kling task failed";
+    console.error(`[pt] Kling task failed (${msg}):\n${raw}`);
+    return new Error(msg);
+}
 async function pollKlingImageTask(taskId, timeoutMs) {
     const start = Date.now();
     let attempts = 0;
@@ -204,7 +221,7 @@ async function pollKlingImageTask(taskId, timeoutMs) {
             return { data: images.map((i) => ({ url: i.url })), elapsed_ms: Date.now() - start };
         }
         if (status === "failed")
-            throw new Error(data.data?.task_status_msg || "Kling task failed");
+            throw klingTaskError(data);
         await sleep(pollDelay(attempts));
     }
     throw new Error(pollTimeoutMsg(taskId, timeoutMs, netErrors));
@@ -454,7 +471,7 @@ async function pollKlingTask(taskId, endpoint, timeoutMs, wantWatermark = false)
         if (status === "failed") {
             if (process.env.PT_DEBUG)
                 console.error(`[pt debug] ${endpoint}/${taskId} => ${JSON.stringify(data, null, 2)}`);
-            throw new Error(data.data?.task_status_msg || "Kling task failed");
+            throw klingTaskError(data);
         }
         await sleep(pollDelay(attempts));
     }
